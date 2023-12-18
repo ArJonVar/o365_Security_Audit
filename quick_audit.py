@@ -21,10 +21,14 @@ class O365Auditor():
         self.powerbi_backend_path = config.get('powerbi_backend_path')
         self.pw=config.get('m365_pw')
         self.raw_path=config.get('raw_data_path')
+        self.operation = ', '.join([f'"{item}"' for item in config.get('operations')])
         self.login_command = f'''$secpasswd = ConvertTo-SecureString '{self.pw}' -AsPlainText -Force
             $o365cred = New-Object System.Management.Automation.PSCredential ("ariel-admin@dowbuilt.com", $secpasswd)
             Connect-ExchangeOnline -Credential $o365cred'''
+        
     # region helper
+    def create_operation_args(self):
+        self.operation=config.get('operation')
     def df_to_excel(self, df, path):
         '''exports data into excel for user to view'''
         df.to_excel(path, index=False)  # Export the DataFrame to an Excel file
@@ -222,20 +226,36 @@ class O365Auditor():
                 )
     def paginated_pwrshl_grab_raw(self, startdate, enddate, pageNumber = 1, delete_old_files = True):
         '''set up to grab all data within date range into seperate .csvs that get combined at the end'''
+        # # Convert string dates to datetime objects
+        # start_date = datetime.strptime(startdate, "%Y/%m/%d")
+        # end_date = datetime.strptime(enddate, "%Y/%m/%d")
+        # # Calculate the difference in days
+        # date_diff = (end_date - start_date).days
+
+        # # Check if the date range is more than 62 days
+        # if date_diff > 62:
+        #     # Split the range into smaller segments
+        #     while start_date < end_date:
+        #         # Calculate the end date of the segment
+        #         segment_end_date = min(start_date + timedelta(days=62), end_date)
+
+        #         # Recursive call for each segment
+        #         pageNumber = self.paginated_pwrshl_grab_raw(start_date.strftime("%Y/%m/%d"), segment_end_date.strftime("%Y/%m/%d"), pageNumber, False)
+
+        #         # Update the start date for the next segment
+        #         start_date = segment_end_date
+        # else:
         unique_id = uuid.uuid1()
         sessionId = f"AuditLogSession-{unique_id}"  # Unique session ID
         moreData = True
-
         # start be clearing what was previously in this folder
         if delete_old_files:
             self.action_to_files_in_folder(self.pages_path, 'delete')
-
         while moreData:
             exportPath = f"{self.pages_path}\AuditLogResults_Page{pageNumber}.csv"
-
             self.commands = f'''{self.login_command}
                 $ExportPath = "{exportPath}"
-                $Results = Search-UnifiedAuditLog -StartDate "{startdate} 00:00:00" -EndDate "{enddate} 00:00:00" -Operations "UserLoggedIn", "UserLoginFailed" -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
+                $Results = Search-UnifiedAuditLog -StartDate "{startdate} 00:00:00" -EndDate "{enddate} 00:00:00" -Operations {self.operation} -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
                 $Results | Export-Csv -Path $ExportPath
                 '''
             self.p = subprocess.run(
@@ -245,7 +265,6 @@ class O365Auditor():
                     capture_output=True,
                     text=True
                 )
-
             if self.wait_for_file(exportPath):
                 # Check if the maximum number of entries was returned
                 total_rows = int(self.create_df(exportPath).to_dict(orient='records')[0]['ResultCount'])
@@ -258,17 +277,15 @@ class O365Auditor():
             else:
                 print("ERROR: Bad argument did not produce a file")
                 moreData= False
-
         print('~DONE~ @ Page', pageNumber)
         self.df_created = pd.concat([self.create_df(csv) for csv in self.action_to_files_in_folder(self.pages_path, 'grab path from')]).sort_values(by='CreationDate')
         # have to drop duplicate b/c "add two weeks" creates a date overlap
         self.df_created = self.df_created.drop_duplicates(subset=['CreationDate', 'UserIds', 'Operations','AuditData','Identity'])
-        
         # Combine all CSV files into one
         if total_rows <= 50000:
             self.report_path = f"{self.folder_path}\AuditLogFull.csv"
             self.df_created.to_csv(self.report_path, index=False)
-
+            return pageNumber
         else:
             earliest_existing_date = self.df_created.iloc[-1]['CreationDate'][:self.df_created.iloc[-1]['CreationDate'].find(' ')]
             earliest_existing_date = self.add_two_weeks(earliest_existing_date)
@@ -367,8 +384,7 @@ class O365Auditor():
                     'logins': report['logins'],
                     'report_location': report['location'],
                     'ip': report['ip'],
-                    'report_uuid': report['uuid'],
-                    'user_uuid': entry['uuid']
+                    'report_uuid': report['uuid']
                 })
         
         return flattened_data
@@ -387,11 +403,13 @@ if __name__ == "__main__":
         'm365_pw': m365_pw,
         'folder_path': r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results",
         'pages_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages",
-        'powerbi_backend_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\audit_data_for_analysis.xlsx"
+        'powerbi_backend_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\audit_data_for_analysis.xlsx",
+        # 'operations':['Reset user password.', 'Set force change user password.', 'Change user password.']
+        'operations': ['UserLoggedIn', 'UserLoginFailed']
         # 'bamb_token': bamb_token,
         # 'b2token': bamb2_token,
         # 'smartsheet_token':smartsheet_token,
     }
 
     oa = O365Auditor(config)
-    oa.run('12/10/2023', '12/16/2023')
+    oa.run('12/01/2023', '12/19/2023')
