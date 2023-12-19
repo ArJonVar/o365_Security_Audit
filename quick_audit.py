@@ -10,6 +10,7 @@ from geoip2 import database
 from pandas.errors import EmptyDataError
 import uuid
 from datetime import datetime, timedelta
+from logger import ghetto_logger
 #endregion
 
 class O365Auditor():
@@ -20,6 +21,7 @@ class O365Auditor():
         self.pages_path = config.get('pages_path')
         self.powerbi_backend_path = config.get('powerbi_backend_path')
         self.pw=config.get('m365_pw')
+        self.log=ghetto_logger("quick_audit.py")
         self.raw_path=config.get('raw_data_path')
         self.operation = ', '.join([f'"{item}"' for item in config.get('operations')])
         self.login_command = f'''$secpasswd = ConvertTo-SecureString '{self.pw}' -AsPlainText -Force
@@ -32,7 +34,7 @@ class O365Auditor():
     def df_to_excel(self, df, path):
         '''exports data into excel for user to view'''
         df.to_excel(path, index=False)  # Export the DataFrame to an Excel file
-        print(f"DataFrame exported to {path}")
+        self.log.log(f"DataFrame exported to {path}")
     def action_to_files_in_folder(self, folder_path, action):
         '''delete used in audit log pages to save space
         grab path from used to make master audit list'''
@@ -48,7 +50,7 @@ class O365Auditor():
                     elif action == "grab path from":
                         file_paths.append(file_path)  # Append the file path to the list
             except Exception as e:
-                print(f'Failed to {action} {file_path}. Reason: {e}')
+                self.log.log(f'Failed to {action} {file_path}. Reason: {e}')
 
         if action == "grab path from":
             return file_paths  # Return the list of file paths
@@ -64,9 +66,9 @@ class O365Auditor():
             if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                 return True  # File exists and has content
             time.sleep(check_interval)
-            print(f'just waited {check_interval} seconds')
+            self.log.log(f'just waited {check_interval} seconds')
             elapsed_time += check_interval
-        print("File not found or is empty after waiting")
+        self.log.log("File not found or is empty after waiting")
         return False  # Timeout reached
     def create_df(self, path):
         '''grabs df from csv and promotes headers'''
@@ -141,7 +143,7 @@ class O365Auditor():
                 start_time = group_df.iloc[i]['CreationDate']
 
                 # Convert UTC to PST
-                utc_time = pd.to_datetime(df.iloc[i]['CreationDate'])
+                utc_time = pd.to_datetime(group_df.iloc[i]['CreationDate'])
                 utc_time_localized = utc_time.tz_localize('UTC')
                 pst_timezone = pytz.timezone('US/Pacific')
                 pst_time = utc_time_localized.tz_convert(pst_timezone)
@@ -163,7 +165,7 @@ class O365Auditor():
                         ip_data_dict = {ip: self.find_ip_details(ip) for ip in unique_ip_list}
                         ip_states = [ip_data_dict[ip]['state'] for ip in unique_ip_list]
                     except:
-                        print('FAILED: ', unique_ip_list)  
+                        self.log.log('FAILED: ', unique_ip_list)  
 
                     if len(set(ip_states)) >= min_unique_states:
                         unique_id = str(uuid.uuid4())
@@ -229,73 +231,6 @@ class O365Auditor():
                     capture_output=True,
                     text=True
                 )
-    def old_paginated_pwrshl_grab_raw(self, startdate, enddate, pageNumber = 1, delete_old_files = True):
-        '''set up to grab all data within date range into seperate .csvs that get combined at the end'''
-        # # Convert string dates to datetime objects
-        # start_date = datetime.strptime(startdate, "%Y/%m/%d")
-        # end_date = datetime.strptime(enddate, "%Y/%m/%d")
-        # # Calculate the difference in days
-        # date_diff = (end_date - start_date).days
-
-        # # Check if the date range is more than 62 days
-        # if date_diff > 62:
-        #     # Split the range into smaller segments
-        #     while start_date < end_date:
-        #         # Calculate the end date of the segment
-        #         segment_end_date = min(start_date + timedelta(days=62), end_date)
-
-        #         # Recursive call for each segment
-        #         pageNumber = self.paginated_pwrshl_grab_raw(start_date.strftime("%Y/%m/%d"), segment_end_date.strftime("%Y/%m/%d"), pageNumber, False)
-
-        #         # Update the start date for the next segment
-        #         start_date = segment_end_date
-        # else:
-        unique_id = uuid.uuid1()
-        sessionId = f"AuditLogSession-{unique_id}"  # Unique session ID
-        moreData = True
-        # start be clearing what was previously in this folder
-        if delete_old_files:
-            self.action_to_files_in_folder(self.pages_path, 'delete')
-        while moreData:
-            exportPath = f"{self.pages_path}\AuditLogResults_Page{pageNumber}.csv"
-            self.commands = f'''{self.login_command}
-                $ExportPath = "{exportPath}"
-                $Results = Search-UnifiedAuditLog -StartDate "{startdate} 00:00:00" -EndDate "{enddate} 00:00:00" -Operations {self.operation} -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
-                $Results | Export-Csv -Path $ExportPath
-                '''
-            self.p = subprocess.run(
-                    ["powershell", "-NoProfile",
-                    "-ExecutionPolicy", "Bypass",
-                    "-Command", self.commands],
-                    capture_output=True,
-                    text=True
-                )
-            if self.wait_for_file(exportPath):
-                # Check if the maximum number of entries was returned
-                total_rows = int(self.create_df(exportPath).to_dict(orient='records')[0]['ResultCount'])
-                current_row = int(self.create_df(exportPath).to_dict(orient='records')[-1]['ResultIndex'])
-                # current_row = (pageNumber)*1000+1
-                moreData = total_rows > current_row
-                print(f"Page {pageNumber}: {current_row} rows out of {total_rows}")
-                if moreData == True:
-                    pageNumber += 1
-            else:
-                print("ERROR: Bad argument did not produce a file")
-                moreData= False
-        print('~DONE~ @ Page', pageNumber)
-        self.df_created = pd.concat([self.create_df(csv) for csv in self.action_to_files_in_folder(self.pages_path, 'grab path from')]).sort_values(by='CreationDate')
-        # have to drop duplicate b/c "add two weeks" creates a date overlap
-        self.df_created = self.df_created.drop_duplicates(subset=['CreationDate', 'UserIds', 'Operations','AuditData','Identity'])
-        # Combine all CSV files into one
-        if total_rows <= 50000:
-            self.report_path = f"{self.folder_path}\AuditLogFull.csv"
-            self.df_created.to_csv(self.report_path, index=False)
-            return pageNumber
-        else:
-            earliest_existing_date = self.df_created.iloc[-1]['CreationDate'][:self.df_created.iloc[-1]['CreationDate'].find(' ')]
-            earliest_existing_date = self.add_two_weeks(earliest_existing_date)
-            # grab the next 50000 rows
-            self.paginated_pwrshl_grab_raw(startdate, earliest_existing_date, pageNumber, False)
     def paginated_pwrshl_grab_raw(self, startdate, enddate, pageNumber=1):
         '''This function loops through each date segment if the date range is more than 62 days, then combines all data into one csv
         this handles the 50,000 row limit on data 
@@ -308,16 +243,16 @@ class O365Auditor():
         end_date = datetime.strptime(enddate, "%m/%d/%Y")
         readable_start_date = startdate
         while start_date < end_date:
-            segment_end_date = min(start_date + timedelta(days=62), end_date)
-            # print("Processing segment starting at:", start_date, " end date: ", end_date, ' seg_end_date: ', segment_end_date)
-            print(f'processing segment {readable_start_date}-{datetime.strptime(str(segment_end_date), "%Y-%m-%d %H:%M:%S").strftime("%m/%d/%Y")}')
+            segment_end_date = min(start_date + timedelta(days=61), end_date)
+            # self.log.log("Processing segment starting at:", start_date, " end date: ", end_date, ' seg_end_date: ', segment_end_date)
+            self.log.log(f'processing segment {readable_start_date}-{datetime.strptime(str(segment_end_date), "%Y-%m-%d %H:%M:%S").strftime("%m/%d/%Y")}')
             # Process the segment
 
             unique_id = uuid.uuid1()
             sessionId = f"AuditLogSession-{unique_id}"
             pageNumber = self.process_segment(start_date, segment_end_date, pageNumber, sessionId)
             pageNumber += 1
-            print(" ")
+            self.log.log(" ")
             # Break the loop if we've reached the end date
             if segment_end_date >= end_date:
                 break
@@ -326,14 +261,14 @@ class O365Auditor():
             start_date = segment_end_date
             readable_start_date = datetime.strptime(str(segment_end_date), "%Y-%m-%d %H:%M:%S").strftime("%m/%d/%Y")
 
-        print('~DONE~ @ Page', pageNumber)
+        self.log.log('~DONE loading data~')
         self.df_created = pd.concat([self.create_df(csv) for csv in self.action_to_files_in_folder(self.pages_path, 'grab path from')]).sort_values(by='CreationDate')
         self.df_created = self.df_created.drop_duplicates(subset=['CreationDate', 'UserIds', 'Operations','AuditData','Identity'])
 
         # Combine all CSV files into one
         self.report_path = f"{self.folder_path}\AuditLogFull.csv"
         self.df_created.to_csv(self.report_path, index=False)
-    def process_segment(self, start_date, end_date, pageNumber, sessionId,):
+    def process_segment(self, start_date, end_date, pageNumber, sessionId):
         '''This loops through each date segment, grabbing the data in 1000 row increments, setting up a page for each increment'''
         moreData = True
         total_rows = 0
@@ -349,12 +284,12 @@ class O365Auditor():
                 total_rows = int(df.to_dict(orient='records')[0]['ResultCount'])
                 current_row = int(df.to_dict(orient='records')[-1]['ResultIndex'])
                 moreData = total_rows > current_row
-                print(f"Page {pageNumber}: {current_row} rows out of {total_rows}")
+                self.log.log(f"Page {pageNumber}: {current_row} rows out of {total_rows}")
 
                 if moreData:
                     pageNumber += 1
             else:
-                print("ERROR: Bad argument did not produce a file")
+                self.log.log("ERROR: Bad argument did not produce a file")
                 moreData = False
             
         return pageNumber
@@ -365,6 +300,7 @@ class O365Auditor():
             $Results = Search-UnifiedAuditLog -StartDate "{start_date.strftime('%m/%d/%Y')} 00:00:00" -EndDate "{end_date.strftime('%m/%d/%Y')} 00:00:00" -Operations "UserLoggedIn", "UserLoginFailed" -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
             $Results | Export-Csv -Path $ExportPath
             '''
+        time.sleep(2)
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", commands], capture_output=True, text=True)
     #endregion
     def flatten_df_data(self, df):
@@ -422,7 +358,7 @@ class O365Auditor():
         self.usrs = []
         for usr in self.dfs:
             self.usrs.append(usr)
-            print(f"Processing user: {usr}")
+            self.log.log(f"Processing user: {usr}")
 
             # location variance audit
             results.extend(self.analyze_ips_in_timeframe(
@@ -439,7 +375,7 @@ class O365Auditor():
                 min_unique_ips=4, 
                 min_unique_states=1, 
                 scenario_str="IP Variance")) 
-        print(f"processed {len(self.dfs)} users")
+        self.log.log(f"processed {len(self.dfs)} users")
         return results
     def order_results(self, results):
         '''explain'''
@@ -492,4 +428,5 @@ if __name__ == "__main__":
     oa = O365Auditor(config)
     # For using existing data
     # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
-    oa.run('9/12/2023', '12/19/2023')
+    # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull - Copy.csv")
+    oa.run('09/01/2023', '12/20/2023')
