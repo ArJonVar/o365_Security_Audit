@@ -130,75 +130,79 @@ class O365Auditor():
     def analyze_ips_in_timeframe(self, df, hours, min_unique_ips, min_unique_states, scenario_str):
         '''looks for flags through df data'''
         results = []
-        last_report_times = {}  # Dictionary to track the last report time for each user    
+        last_report_times = {}  # Dictionary to track the last report time for each user
 
-        for i in range(len(df)):
-            user_id = df.iloc[i]["Resulting Usr"]
-            start_time = df.iloc[i]['CreationDate']
+        # Grouping the DataFrame by 'Operation' column
+        grouped_df = df.groupby('Operation')
 
-            # Convert UTC to PST
-            utc_time = pd.to_datetime(df.iloc[i]['CreationDate'])
-            utc_time_localized = utc_time.tz_localize('UTC')
-            pst_timezone = pytz.timezone('US/Pacific')
-            pst_time = utc_time_localized.tz_convert(pst_timezone)
+        for operation, group_df in grouped_df:
+            for i in range(len(group_df)):
+                user_id = group_df.iloc[i]["Resulting Usr"]
+                start_time = group_df.iloc[i]['CreationDate']
 
-            readable_start_time= pst_time.strftime('%m/%d/%Y %I:%M %p') + " PST"   
+                # Convert UTC to PST
+                utc_time = pd.to_datetime(df.iloc[i]['CreationDate'])
+                utc_time_localized = utc_time.tz_localize('UTC')
+                pst_timezone = pytz.timezone('US/Pacific')
+                pst_time = utc_time_localized.tz_convert(pst_timezone)
+
+                readable_start_time= pst_time.strftime('%m/%d/%Y %I:%M %p') + " PST"   
 
 
 
-            # Check if the user has a recent report within the timeframe
-            if user_id in last_report_times and (start_time - last_report_times[user_id]).total_seconds() / 3600 < hours:
-                continue  # Skip to the next row if within the timeframe    
+                # Check if the user has a recent report within the timeframe
+                if user_id in last_report_times and (start_time - last_report_times[user_id]).total_seconds() / 3600 < hours:
+                    continue  # Skip to the next row if within the timeframe    
 
-            end_time = start_time + pd.Timedelta(hours=hours)
-            relevant_rows = df[(df['CreationDate'] >= start_time) & (df['CreationDate'] <= end_time)]
-            unique_ip_list = [ip for ip in relevant_rows['ClientIP'].unique() if ip != '']  
+                end_time = start_time + pd.Timedelta(hours=hours)
+                relevant_rows = df[(df['CreationDate'] >= start_time) & (df['CreationDate'] <= end_time)]
+                unique_ip_list = [ip for ip in relevant_rows['ClientIP'].unique() if ip != '']  
 
-            if len(unique_ip_list) >= min_unique_ips:
-                try:
-                    ip_data_dict = {ip: self.find_ip_details(ip) for ip in unique_ip_list}
-                    ip_states = [ip_data_dict[ip]['state'] for ip in unique_ip_list]
-                except:
-                    print('FAILED: ', unique_ip_list)   
+                if len(unique_ip_list) >= min_unique_ips:
+                    try:
+                        ip_data_dict = {ip: self.find_ip_details(ip) for ip in unique_ip_list}
+                        ip_states = [ip_data_dict[ip]['state'] for ip in unique_ip_list]
+                    except:
+                        print('FAILED: ', unique_ip_list)  
 
-                if len(set(ip_states)) >= min_unique_states:
-                    unique_id = str(uuid.uuid4())
-                    report = []
-                    for ip in unique_ip_list:
-                        ip_data = ip_data_dict[ip]
-                        try:
-                            ip_state = ip_data.get('state', "XX")
-                            rownums = relevant_rows.index[relevant_rows['ClientIP'] == ip].tolist()
-                            if len(ip_state) != 2:
+                    if len(set(ip_states)) >= min_unique_states:
+                        unique_id = str(uuid.uuid4())
+                        report = []
+                        for ip in unique_ip_list:
+                            ip_data = ip_data_dict[ip]
+                            try:
+                                ip_state = ip_data.get('state', "XX")
+                                rownums = relevant_rows.index[relevant_rows['ClientIP'] == ip].tolist()
+                                if len(ip_state) != 2:
+                                    country = ip_data['country']
+                                    report.append({'logins': len(rownums), "location": country, "ip":ip, "uuid":unique_id})
+                                    # report.append(f"{len(rownums)} Logins || {country}: {ip}")
+                                else:
+                                    report.append({'logins': len(rownums), "location": ip_state, "ip":ip, "uuid":unique_id})
+                                    # report.append(f"{len(rownums)} Logins || {ip_state}: {ip}")
+                            except TypeError:
+                                rownums = relevant_rows.index[relevant_rows['ClientIP'] == ip].tolist()
                                 country = ip_data['country']
                                 report.append({'logins': len(rownums), "location": country, "ip":ip, "uuid":unique_id})
                                 # report.append(f"{len(rownums)} Logins || {country}: {ip}")
-                            else:
-                                report.append({'logins': len(rownums), "location": ip_state, "ip":ip, "uuid":unique_id})
-                                # report.append(f"{len(rownums)} Logins || {ip_state}: {ip}")
-                        except TypeError:
-                            rownums = relevant_rows.index[relevant_rows['ClientIP'] == ip].tolist()
-                            country = ip_data['country']
-                            report.append({'logins': len(rownums), "location": country, "ip":ip, "uuid":unique_id})
-                            # report.append(f"{len(rownums)} Logins || {country}: {ip}")
-                    location = []
-                    for item in report:
-                        if item['location'] not in location:
-                            location.append(item['location'])
+                        location = []
+                        for item in report:
+                            if item['location'] not in location:
+                                location.append(item['location'])
 
-                    results.append({'Scenario': scenario_str,
-                                    'Start Time': readable_start_time,
-                                    'User': user_id,
-                                    'ip_count': len(report),
-                                    'location_count':(len(location)),
-                                    'location_list': location,
-                                    'Report': report,
-                                    'uuid':unique_id, })  
+                        results.append({'Scenario': scenario_str,
+                                        'Operation': operation,
+                                        'Start Time': readable_start_time,
+                                        'User': user_id,
+                                        'ip_count': len(report),
+                                        'location_count': len(location),
+                                        'location_list': location,
+                                        'Report': report,
+                                        'uuid': unique_id})
 
-                    last_report_times[user_id] = start_time  # Update the last report time for the user 
+                        last_report_times[user_id] = start_time  # Update the last report time for the user
 
         return results
-            # Function to flatten the nested structures
     def parse_datetime(self, time_str):
         '''parses teh date times for the results, needs to work with PST which is a string and doesnt parse well'''
         # Remove the 'PST' part and parse the datetime
@@ -208,6 +212,7 @@ class O365Auditor():
         pacific = pytz.timezone('America/Los_Angeles')
         return pacific.localize(dt)
     # endregion
+    #region grab data
     def basic_pwrshl_grab_raw(self, startdate, enddate):
             '''explain'''
             self.path = f"{self.pages_path}\AuditLogResults_Page1.csv"
@@ -224,7 +229,7 @@ class O365Auditor():
                     capture_output=True,
                     text=True
                 )
-    def paginated_pwrshl_grab_raw(self, startdate, enddate, pageNumber = 1, delete_old_files = True):
+    def old_paginated_pwrshl_grab_raw(self, startdate, enddate, pageNumber = 1, delete_old_files = True):
         '''set up to grab all data within date range into seperate .csvs that get combined at the end'''
         # # Convert string dates to datetime objects
         # start_date = datetime.strptime(startdate, "%Y/%m/%d")
@@ -291,6 +296,77 @@ class O365Auditor():
             earliest_existing_date = self.add_two_weeks(earliest_existing_date)
             # grab the next 50000 rows
             self.paginated_pwrshl_grab_raw(startdate, earliest_existing_date, pageNumber, False)
+    def paginated_pwrshl_grab_raw(self, startdate, enddate, pageNumber=1):
+        '''This function loops through each date segment if the date range is more than 62 days, then combines all data into one csv
+        this handles the 50,000 row limit on data 
+        (b/c the data is not ordered by date so I can't just pull 50,000 rows and then start at the oldest date)'''
+        # Clearing previous files (to prep for new request)
+        self.action_to_files_in_folder(self.pages_path, 'delete')
+
+        # Convert string dates to datetime objects
+        start_date = datetime.strptime(startdate, "%m/%d/%Y")
+        end_date = datetime.strptime(enddate, "%m/%d/%Y")
+        readable_start_date = startdate
+        while start_date < end_date:
+            segment_end_date = min(start_date + timedelta(days=62), end_date)
+            # print("Processing segment starting at:", start_date, " end date: ", end_date, ' seg_end_date: ', segment_end_date)
+            print(f'processing segment {readable_start_date}-{datetime.strptime(str(segment_end_date), "%Y-%m-%d %H:%M:%S").strftime("%m/%d/%Y")}')
+            # Process the segment
+
+            unique_id = uuid.uuid1()
+            sessionId = f"AuditLogSession-{unique_id}"
+            pageNumber = self.process_segment(start_date, segment_end_date, pageNumber, sessionId)
+            pageNumber += 1
+            print(" ")
+            # Break the loop if we've reached the end date
+            if segment_end_date >= end_date:
+                break
+
+            # Update start date for the next segment
+            start_date = segment_end_date
+            readable_start_date = datetime.strptime(str(segment_end_date), "%Y-%m-%d %H:%M:%S").strftime("%m/%d/%Y")
+
+        print('~DONE~ @ Page', pageNumber)
+        self.df_created = pd.concat([self.create_df(csv) for csv in self.action_to_files_in_folder(self.pages_path, 'grab path from')]).sort_values(by='CreationDate')
+        self.df_created = self.df_created.drop_duplicates(subset=['CreationDate', 'UserIds', 'Operations','AuditData','Identity'])
+
+        # Combine all CSV files into one
+        self.report_path = f"{self.folder_path}\AuditLogFull.csv"
+        self.df_created.to_csv(self.report_path, index=False)
+    def process_segment(self, start_date, end_date, pageNumber, sessionId,):
+        '''This loops through each date segment, grabbing the data in 1000 row increments, setting up a page for each increment'''
+        moreData = True
+        total_rows = 0
+
+        while moreData:
+            exportPath = f"{self.pages_path}/AuditLogResults_Page{pageNumber}.csv"
+
+            # Running PowerShell command
+            self.run_powershell_command(start_date, end_date, exportPath, sessionId)
+
+            if self.wait_for_file(exportPath):
+                df = self.create_df(exportPath)
+                total_rows = int(df.to_dict(orient='records')[0]['ResultCount'])
+                current_row = int(df.to_dict(orient='records')[-1]['ResultIndex'])
+                moreData = total_rows > current_row
+                print(f"Page {pageNumber}: {current_row} rows out of {total_rows}")
+
+                if moreData:
+                    pageNumber += 1
+            else:
+                print("ERROR: Bad argument did not produce a file")
+                moreData = False
+            
+        return pageNumber
+    def run_powershell_command(self, start_date, end_date, exportPath, sessionId):
+        '''powershell that does the audit, gets looped many time over by handlers'''
+        commands = f'''{self.login_command}
+            $ExportPath = "{exportPath}"
+            $Results = Search-UnifiedAuditLog -StartDate "{start_date.strftime('%m/%d/%Y')} 00:00:00" -EndDate "{end_date.strftime('%m/%d/%Y')} 00:00:00" -Operations "UserLoggedIn", "UserLoginFailed" -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
+            $Results | Export-Csv -Path $ExportPath
+            '''
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", commands], capture_output=True, text=True)
+    #endregion
     def flatten_df_data(self, df):
         '''the main data is in a nested dictionary in "AuditData" column'''
         data = df.to_dict(orient='records')
@@ -363,6 +439,7 @@ class O365Auditor():
                 min_unique_ips=4, 
                 min_unique_states=1, 
                 scenario_str="IP Variance")) 
+        print(f"processed {len(self.dfs)} users")
         return results
     def order_results(self, results):
         '''explain'''
@@ -372,10 +449,11 @@ class O365Auditor():
         '''power bi wants FLAT TABLE data, and so this will do that'''
         flattened_data= []
 
-        for entry in oa.ordered_results:
+        for entry in results:
             for report in entry['Report']:
                 flattened_data.append({
                     'Scenario': entry['Scenario'],
+                    'Operation': entry['Operation'],
                     'Start Time': entry['Start Time'],
                     'User': entry['User'],
                     'ip_count': entry['ip_count'],
@@ -412,4 +490,6 @@ if __name__ == "__main__":
     }
 
     oa = O365Auditor(config)
-    oa.run('12/01/2023', '12/19/2023')
+    # For using existing data
+    # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
+    oa.run('9/12/2023', '12/19/2023')
