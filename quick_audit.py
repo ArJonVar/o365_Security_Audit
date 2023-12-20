@@ -220,10 +220,27 @@ class O365Auditor():
         # Set the timezone to Pacific Time
         pacific = pytz.timezone('America/Los_Angeles')
         return pacific.localize(dt)
-    def is_duplicate(self, dataset1, dataset2):
-        '''makes sure not to repost to ss rows that are already there'''
-        fields_to_compare = ['User', 'Start Time', 'Operation', 'Scenario', 'ip count', 'location count', 'location list', 'report location', 'report ip', 'HIDE_report uuid']
-        return all(dataset1[field] == dataset2[field] for field in fields_to_compare)
+    def return_unique_posting_data(self, primary, reference, fields_to_compare):
+        '''makes sure not to repost to ss rows that are already there
+        the primary checks if any of its rows (on specific fields) are already existing in reference''' 
+
+        # Function to create a comparable version of an item
+        def make_comparable(item):
+            return {field: item[field] for field in fields_to_compare}  
+
+        # Create a set of comparable items from the reference dataset
+        reference_comparable = {frozenset(make_comparable(item).items()) for item in reference} 
+
+        # Filter out duplicates and collect unique data
+        unique_posting_data = []
+        for item in primary:
+            item_comparable = frozenset(make_comparable(item).items())
+            if item_comparable not in reference_comparable:
+                unique_posting_data.append(item)    
+
+        return unique_posting_data
+
+
     # endregion
     #region grab data
     def basic_pwrshl_grab_raw(self, startdate, enddate):
@@ -416,24 +433,15 @@ class O365Auditor():
         return flattened_data
     def prep_ss_post(self, data):
         '''post data is needs to be any data the report came back with that is not already on ss'''
-        sheet = grid(self.sheetid)
-        sheet.fetch_content()
-        sheet_data = sheet.df.to_dict(orient="records")
-
-        # Convert string fields to comparable formats in sheet_data
-        for item in sheet_data:
-            item['ip count'] = int(item['ip count'])
-            item['location count'] = int(item['location count'])
-            item['report login count'] = int(item['report login count'])
+        self.gridsheet = grid(self.sheetid)
+        self.gridsheet.fetch_content()
+        sheet_data = self.gridsheet.df.to_dict(orient="records")
 
         # Finding duplicates
-        duplicates = []
-        for new_data_row in data:
-            for ss_data_row in sheet_data:
-                if self.is_duplicate(new_data_row, ss_data_row):
-                    duplicates.append(new_data_row)
-        
-        ss_posting_data = [posting_ss_row for posting_ss_row in data if posting_ss_row not in duplicates]
+        fields_to_compare = ['Start Time', 'User', 'location list']
+        ss_posting_data = self.return_unique_posting_data(self.processing_data, sheet_data, fields_to_compare)
+
+        self.log.log('posting: ', ss_posting_data)
 
         return ss_posting_data
     #endregion
@@ -447,8 +455,29 @@ class O365Auditor():
         self.ordered_results = self.order_results(self.results)
         self.processing_data = self.transform_for_dataprocessing(self.ordered_results)
         self.ss_post_data = self.prep_ss_post(self.processing_data)
-        # grid.post_new_rows(self.ss_post_data)
-        # grid.handle_update_stamps()
+        try:
+            self.gridsheet.post_new_rows(self.ss_post_data)
+        except IndexError:
+            # if self.ss_post_data is empty
+            pass
+        self.gridsheet.handle_update_stamps()
+
+    def run_recent(self):
+        '''grabs yesterday and tomorrow for run's inputs'''
+        today_date = datetime.now()
+
+        # Calculating yesterday's date (the day before today)
+        yesterday_date = today_date - timedelta(days=1)
+
+        # Calculating tomorrow's date (the day after today)
+        tomorrow_date = today_date + timedelta(days=1)
+
+        # Formatting the dates as mm/dd/yyyy
+        formatted_yesterday = yesterday_date.strftime("%m/%d/%Y")
+        formatted_tomorrow = tomorrow_date.strftime("%m/%d/%Y")
+
+        formatted_yesterday, formatted_tomorrow
+        self.run(formatted_yesterday, formatted_tomorrow)
 
 if __name__ == "__main__":
     config = {
@@ -465,5 +494,6 @@ if __name__ == "__main__":
     oa = O365Auditor(config)
     # For using existing data
     # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
-    # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull - Copy.csv")
-    oa.run('12/10/2023', '12/20/2023')
+    # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull.csv")
+    # oa.run('12/15/2023', '12/20/2023')
+    oa.run_recent()
