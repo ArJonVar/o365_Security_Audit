@@ -34,6 +34,13 @@ class O365Auditor():
         grid.token=smartsheet_token
         self.smart = smartsheet.Smartsheet(access_token=self.smartsheet_token)
         self.smart.errors_as_exceptions(True)
+        self.us_state_abbreviations = [
+            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+            "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+            "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+            "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+            "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"
+        ]
         
     #region helper
     def create_operation_args(self):
@@ -182,7 +189,7 @@ class O365Auditor():
                             try:
                                 ip_state = ip_data.get('state', "XX")
                                 rownums = relevant_rows.index[relevant_rows['ClientIP'] == ip].tolist()
-                                if len(ip_state) != 2:
+                                if ip_state not in self.us_state_abbreviations:
                                     country = ip_data['country']
                                     report.append({'logins': len(rownums), "location": country, "ip":ip, "uuid":unique_id})
                                     # report.append(f"{len(rownums)} Logins || {country}: {ip}")
@@ -461,7 +468,6 @@ class O365Auditor():
             # if self.ss_post_data is empty
             pass
         self.gridsheet.handle_update_stamps()
-
     def run_recent(self):
         '''grabs yesterday and tomorrow for run's inputs'''
         today_date = datetime.now()
