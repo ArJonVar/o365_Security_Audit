@@ -109,15 +109,20 @@ class O365Auditor():
 
         return new_date_str
     def flatten_dict(self, d, parent_key='', sep='_'):
-        '''flattens dict'''
+        '''flattends dict, k is current key, v is value, d is dict, sep seperates the key from the number. parent key helps with recursion'''
         items = []
         for k, v in d.items():
             new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            # print(f"Key: {k}, Value: {v}, New Key: {new_key}")  # Print current key, value, and new key
             if isinstance(v, dict):
                 items.extend(self.flatten_dict(v, new_key, sep=sep).items())
             elif isinstance(v, list):
                 for i, item in enumerate(v):
-                    items.extend(self.flatten_dict(item, f"{new_key}{sep}{i}", sep=sep).items())
+                    # print(f"List item: {item}, Type: {type(item)}")  # Print each item in the list and its type
+                    if isinstance(item, dict):
+                        items.extend(self.flatten_dict(item, f"{new_key}{sep}{i}", sep=sep).items())
+                    else:
+                        items.append((f"{new_key}{sep}{i}", item))
             else:
                 items.append((new_key, v))
         return dict(items)
@@ -143,6 +148,28 @@ class O365Auditor():
         iso_code = response.subdivisions.most_specific.iso_code
         result = {'state':iso_code, 'city':response.city.name, 'country': response.country.name, 'IP':ip}
         return result   
+    def convert_df_utc_to_pst(self, df):
+        '''Convert 'CreationDate' from UTC to PST in the DataFrame'''
+        # Define the PST timezone
+        pst_timezone = pytz.timezone('US/Pacific')
+
+        # Function to convert each row
+        def convert_row(row):
+            utc_time = pd.to_datetime(row['CreationDate'])
+            utc_time_localized = utc_time.tz_localize('UTC')
+            pst_time = utc_time_localized.tz_convert(pst_timezone)
+            return pst_time.strftime('%m/%d/%Y %I:%M %p') + " PST"
+
+        # Check if 'CreationDate' column exists in the DataFrame
+        if 'CreationDate' in df.columns:
+            # Apply the conversion to each row
+            df['CreationDate_PST'] = df.apply(convert_row, axis=1)
+        else:
+            # Handle the case where 'CreationDate' is not in the DataFrame
+            print("Column 'CreationDate' not found in DataFrame.")
+            return None  # Explicitly return None if the column is not found
+
+        return df  # Return the modified DataFrame
     def analyze_ips_in_timeframe(self, df, hours, min_unique_ips, min_unique_states, scenario_str):
         '''looks for flags through df data'''
         results = []
@@ -155,6 +182,7 @@ class O365Auditor():
             for i in range(len(group_df)):
                 user_id = group_df.iloc[i]["Resulting Usr"]
                 start_time = group_df.iloc[i]['CreationDate']
+                
 
                 # Convert UTC to PST
                 utc_time = pd.to_datetime(group_df.iloc[i]['CreationDate'])
@@ -246,16 +274,38 @@ class O365Auditor():
                 unique_posting_data.append(item)    
 
         return unique_posting_data
+    def get_surrounding_days(self, date_str):
+        '''explain'''
+        date_obj = datetime.strptime(date_str, "%m/%d/%Y")
+        # Calculating yesterday's date (the day before today)
+        startdate = date_obj - timedelta(days=2)
 
+        # Calculating tomorrow's date (the day after today)
+        enddate = date_obj + timedelta(days=2)
 
+        # Formatting the dates as mm/dd/yyyy
+        formatted_startdate = startdate.strftime("%m/%d/%Y")
+        formatted_enddate = enddate.strftime("%m/%d/%Y")
+        return formatted_startdate, formatted_enddate 
+    def filter_df_for_report(self, df, usr, ip_list, ip_mode):
+        '''filters df for activity report by only looking at the correct user and correct ips'''
+        '''takes the 'self.df_w_all_usrs' and filteres the ips & not availables before continuing'''
+        self.df_to_excel(df, r'C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages\debug.xlsx')
+        usr_filtered_df = df[(df['Resulting Usr'].str.lower() == str(usr).lower()) | (df['Resulting Usr'] == "Column missing")]
+        if ip_mode == "exclude":
+            ip_filtered_df = usr_filtered_df[~usr_filtered_df['ActorIpAddress'].isin(ip_list)]
+        elif ip_mode == "include":
+            ip_filtered_df = usr_filtered_df[usr_filtered_df['ActorIpAddress'].isin(ip_list)]
+
+        return usr_filtered_df
     # endregion
     #region grab data
-    def basic_pwrshl_grab_raw(self, startdate, enddate):
+    def basic_pwrshl_grab_raw(self, startdate, enddate, usr):
             '''explain'''
             self.path = f"{self.pages_path}\AuditLogResults_Page1.csv"
             self.commands = f'''{self.login_command}
                 $ExportPath = "{self.path}"
-                $Results = Search-UnifiedAuditLog -StartDate "{startdate} 00:00:00" -EndDate "{enddate} 00:00:00" -Operations "UserLoggedIn", "UserLoginFailed" -ResultSize 5000 -SessionCommand ReturnLargeSet 
+                $Results = Search-UnifiedAuditLog -StartDate "{startdate} 14:00:00" -EndDate "{enddate} 02:00:00" -ResultSize 5000 -SessionCommand ReturnLargeSet -UserIds "Not Available", "{usr}" 
                 $Results | Export-Csv -Path $ExportPath
                 '''
 
@@ -363,19 +413,24 @@ class O365Auditor():
         df['IP Country'] = df['ClientIP'].apply(lambda x: self.find_ip_details(x).get('country', 'Unknown'))
         return df
     def expose_ios_users(self, df):
-        '''actions on ios hides the userid, but can be found in actor id'''
-        filtered_df = df[df["Actor_1_ID"] != ""]
+        '''actions on ios hides the userid, but can be found in actor id''' 
+        if 'Actor_1_ID' in df.columns:
+            filtered_df = df[df["Actor_1_ID"] != ""]    
+            # Creating a dictionary with unique "Actor_1_ID" as keys and corresponding "Actor_0_ID" as values
+            actor_dict = dict(zip(filtered_df["Actor_0_ID"], filtered_df["Actor_1_ID"]))    
 
-        # Creating a dictionary with unique "Actor_1_ID" as keys and corresponding "Actor_0_ID" as values
-        actor_dict = dict(zip(filtered_df["Actor_0_ID"], filtered_df["Actor_1_ID"]))
+            def replace_actor_id(row):
+                # If Actor_1_ID is empty, use UserIds
+                if row["Actor_1_ID"] == "" or row["Actor_1_ID"] == "Not Available":
+                    return actor_dict.get(row["Actor_0_ID"], row["Actor_1_ID"])
+                return row["Actor_1_ID"]    
 
-        def replace_actor_id(row):
-            if row["Actor_1_ID"] == "":
-                return actor_dict.get(row["Actor_0_ID"], row["Actor_1_ID"])
-            return row["Actor_1_ID"]
+            df["Actor_1_ID"] = df.apply(replace_actor_id, axis=1)
+            df["Resulting Usr"] = df["Actor_1_ID"].copy()
+        else:
+            # If Actor_1_ID column doesn't exist, use UserIds for Resulting Usr
+            df["Resulting Usr"] = df["UserIds"]
 
-        df["Actor_1_ID"] = df.apply(replace_actor_id, axis=1)
-        df["Resulting Usr"] = df["Actor_1_ID"].copy()
         return df
     def audit_by_user(self,df):
         '''goes through each user and audits their data given specific audit scenarios, also appends their user to a list'''
@@ -470,20 +525,23 @@ class O365Auditor():
         self.gridsheet.handle_update_stamps()
     def run_recent(self):
         '''grabs yesterday and tomorrow for run's inputs'''
-        today_date = datetime.now()
-
-        # Calculating yesterday's date (the day before today)
-        yesterday_date = today_date - timedelta(days=1)
-
-        # Calculating tomorrow's date (the day after today)
-        tomorrow_date = today_date + timedelta(days=1)
-
-        # Formatting the dates as mm/dd/yyyy
-        formatted_yesterday = yesterday_date.strftime("%m/%d/%Y")
-        formatted_tomorrow = tomorrow_date.strftime("%m/%d/%Y")
-
-        formatted_yesterday, formatted_tomorrow
+        today_date = datetime.now().strftime("%m/%d/%Y")
+        formatted_yesterday, formatted_tomorrow = self.get_surrounding_days(today_date)
         self.run(formatted_yesterday, formatted_tomorrow)
+    def run_activity_report(self, activity_date, usr, ip_list = [], ip_mode = 'exclude'):
+        '''to explore suspicious activity of specific user on specific day
+        ip_mode will either be exclude or include, to search for SPECIFIC ip, or all ip EXCEPT specific one'''
+        startdate, enddate = self.get_surrounding_days(activity_date)
+        print(f'working on time segment {startdate}-{enddate}')
+        self.action_to_files_in_folder(self.pages_path, 'delete')
+        self.basic_pwrshl_grab_raw(startdate, enddate, usr)
+        self.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
+        self.df_flattened = self.flatten_df_data(self.df_created)
+        self.df_w_ip = self.add_ip_columns(self.df_flattened)
+        self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
+        self.filtered_df = self.filter_df_for_report(self.df_w_all_usrs, usr, ip_list, ip_mode)
+        final_df = self.convert_df_utc_to_pst(self.filtered_df)
+        self.df_to_excel(final_df, r'C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages\AuditLogResults_Page.xlsx')
 
 if __name__ == "__main__":
     config = {
@@ -502,4 +560,5 @@ if __name__ == "__main__":
     # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
     # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull.csv")
     # oa.run('12/15/2023', '12/20/2023')
-    oa.run_recent()
+    # oa.run_recent()
+    oa.run_activity_report('11/20/2023', 'lizette@dowbuilt.com')
