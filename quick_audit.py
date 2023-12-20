@@ -1,16 +1,18 @@
 #region imports
 import json
 import time
-from globals import m365_pw
+from globals import m365_pw, smartsheet_token
 import subprocess
 import pandas as pd
 import os
 import pytz
 from geoip2 import database
+import smartsheet
 from pandas.errors import EmptyDataError
 import uuid
 from datetime import datetime, timedelta
 from logger import ghetto_logger
+from smartsheet_grid import grid
 #endregion
 
 class O365Auditor():
@@ -18,17 +20,22 @@ class O365Auditor():
     def __init__(self, config):
         self.config = config
         self.folder_path = config.get('folder_path')
+        self.smartsheet_token = config.get('smartsheet_token')
         self.pages_path = config.get('pages_path')
         self.powerbi_backend_path = config.get('powerbi_backend_path')
         self.pw=config.get('m365_pw')
         self.log=ghetto_logger("quick_audit.py")
         self.raw_path=config.get('raw_data_path')
+        self.sheetid=config.get('ss_gui_sheetid')
         self.operation = ', '.join([f'"{item}"' for item in config.get('operations')])
         self.login_command = f'''$secpasswd = ConvertTo-SecureString '{self.pw}' -AsPlainText -Force
             $o365cred = New-Object System.Management.Automation.PSCredential ("ariel-admin@dowbuilt.com", $secpasswd)
             Connect-ExchangeOnline -Credential $o365cred'''
+        grid.token=smartsheet_token
+        self.smart = smartsheet.Smartsheet(access_token=self.smartsheet_token)
+        self.smart.errors_as_exceptions(True)
         
-    # region helper
+    #region helper
     def create_operation_args(self):
         self.operation=config.get('operation')
     def df_to_excel(self, df, path):
@@ -213,6 +220,10 @@ class O365Auditor():
         # Set the timezone to Pacific Time
         pacific = pytz.timezone('America/Los_Angeles')
         return pacific.localize(dt)
+    def is_duplicate(self, dataset1, dataset2):
+        '''makes sure not to repost to ss rows that are already there'''
+        fields_to_compare = ['User', 'Start Time', 'Operation', 'Scenario', 'ip count', 'location count', 'location list', 'report location', 'report ip', 'HIDE_report uuid']
+        return all(dataset1[field] == dataset2[field] for field in fields_to_compare)
     # endregion
     #region grab data
     def basic_pwrshl_grab_raw(self, startdate, enddate):
@@ -303,6 +314,7 @@ class O365Auditor():
         time.sleep(2)
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", commands], capture_output=True, text=True)
     #endregion
+    #region process data
     def flatten_df_data(self, df):
         '''the main data is in a nested dictionary in "AuditData" column'''
         data = df.to_dict(orient='records')
@@ -372,7 +384,7 @@ class O365Auditor():
             results.extend(self.analyze_ips_in_timeframe(
                 df=self.dfs[usr], 
                 hours=3, 
-                min_unique_ips=4, 
+                min_unique_ips=5, 
                 min_unique_states=1, 
                 scenario_str="IP Variance")) 
         self.log.log(f"processed {len(self.dfs)} users")
@@ -381,7 +393,7 @@ class O365Auditor():
         '''explain'''
         sorted_data = sorted(results, key=lambda x: self.parse_datetime(x['Start Time']))
         return sorted_data
-    def transform_for_powerbi(self, results):
+    def transform_for_dataprocessing(self, results):
         '''power bi wants FLAT TABLE data, and so this will do that'''
         flattened_data= []
 
@@ -392,16 +404,40 @@ class O365Auditor():
                     'Operation': entry['Operation'],
                     'Start Time': entry['Start Time'],
                     'User': entry['User'],
-                    'ip_count': entry['ip_count'],
-                    'location_count': entry['location_count'],
-                    'location_list': ', '.join(entry['location_list']),
-                    'logins': report['logins'],
-                    'report_location': report['location'],
-                    'ip': report['ip'],
-                    'report_uuid': report['uuid']
+                    'ip count': entry['ip_count'],
+                    'location count': entry['location_count'],
+                    'location list': ', '.join(entry['location_list']),
+                    'report login count': report['logins'],
+                    'report location': report['location'],
+                    'report ip': report['ip'],
+                    'HIDE_report uuid': report['uuid']
                 })
         
         return flattened_data
+    def prep_ss_post(self, data):
+        '''post data is needs to be any data the report came back with that is not already on ss'''
+        sheet = grid(self.sheetid)
+        sheet.fetch_content()
+        sheet_data = sheet.df.to_dict(orient="records")
+
+        # Convert string fields to comparable formats in sheet_data
+        for item in sheet_data:
+            item['ip count'] = int(item['ip count'])
+            item['location count'] = int(item['location count'])
+            item['report login count'] = int(item['report login count'])
+
+        # Finding duplicates
+        duplicates = []
+        for new_data_row in data:
+            for ss_data_row in sheet_data:
+                if self.is_duplicate(new_data_row, ss_data_row):
+                    duplicates.append(new_data_row)
+        
+        ss_posting_data = [posting_ss_row for posting_ss_row in data if posting_ss_row not in duplicates]
+
+        return ss_posting_data
+    #endregion
+    
     def run(self, starddate, enddate):
         self.paginated_pwrshl_grab_raw(starddate, enddate)
         self.df_flattened = self.flatten_df_data(self.df_created)
@@ -409,8 +445,10 @@ class O365Auditor():
         self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
         self.results = self.audit_by_user(self.df_w_all_usrs)
         self.ordered_results = self.order_results(self.results)
-        self.powerbi_data = self.transform_for_powerbi(self.ordered_results)
-        self.df_to_excel(pd.DataFrame(self.powerbi_data), self.powerbi_backend_path)
+        self.processing_data = self.transform_for_dataprocessing(self.ordered_results)
+        self.ss_post_data = self.prep_ss_post(self.processing_data)
+        # grid.post_new_rows(self.ss_post_data)
+        # grid.handle_update_stamps()
 
 if __name__ == "__main__":
     config = {
@@ -419,14 +457,13 @@ if __name__ == "__main__":
         'pages_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages",
         'powerbi_backend_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\audit_data_for_analysis.xlsx",
         # 'operations':['Reset user password.', 'Set force change user password.', 'Change user password.']
-        'operations': ['UserLoggedIn', 'UserLoginFailed']
-        # 'bamb_token': bamb_token,
-        # 'b2token': bamb2_token,
-        # 'smartsheet_token':smartsheet_token,
+        'operations': ['UserLoggedIn', 'UserLoginFailed'],
+        'smartsheet_token':smartsheet_token,
+        'ss_gui_sheetid': 4506324192677764
     }
 
     oa = O365Auditor(config)
     # For using existing data
     # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
     # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull - Copy.csv")
-    oa.run('09/01/2023', '12/20/2023')
+    oa.run('12/10/2023', '12/20/2023')
