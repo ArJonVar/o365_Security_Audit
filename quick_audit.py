@@ -23,13 +23,14 @@ class O365Auditor():
         self.smartsheet_token = config.get('smartsheet_token')
         self.pages_path = config.get('pages_path')
         self.powerbi_backend_path = config.get('powerbi_backend_path')
+        self.email=config.get('email')
         self.pw=config.get('m365_pw')
         self.log=ghetto_logger("quick_audit.py")
         self.raw_path=config.get('raw_data_path')
         self.sheetid=config.get('ss_gui_sheetid')
         self.operation = ', '.join([f'"{item}"' for item in config.get('operations')])
         self.login_command = f'''$secpasswd = ConvertTo-SecureString '{self.pw}' -AsPlainText -Force
-            $o365cred = New-Object System.Management.Automation.PSCredential ("ariel-admin@dowbuilt.com", $secpasswd)
+            $o365cred = New-Object System.Management.Automation.PSCredential ("{self.email}", $secpasswd)
             Connect-ExchangeOnline -Credential $o365cred'''
         grid.token=smartsheet_token
         self.smart = smartsheet.Smartsheet(access_token=self.smartsheet_token)
@@ -43,8 +44,6 @@ class O365Auditor():
         ]
         
     #region helper
-    def create_operation_args(self):
-        self.operation=config.get('operation')
     def df_to_excel(self, df, path):
         '''exports data into excel for user to view'''
         df.to_excel(path, index=False)  # Export the DataFrame to an Excel file
@@ -150,26 +149,29 @@ class O365Auditor():
         return result   
     def convert_df_utc_to_pst(self, df):
         '''Convert 'CreationDate' from UTC to PST in the DataFrame'''
+        # Create a copy of the DataFrame to avoid SettingWithCopyWarning
+        df_copy = df.copy() 
+
         # Define the PST timezone
-        pst_timezone = pytz.timezone('US/Pacific')
+        pst_timezone = pytz.timezone('US/Pacific')  
 
         # Function to convert each row
         def convert_row(row):
             utc_time = pd.to_datetime(row['CreationDate'])
             utc_time_localized = utc_time.tz_localize('UTC')
             pst_time = utc_time_localized.tz_convert(pst_timezone)
-            return pst_time.strftime('%m/%d/%Y %I:%M %p') + " PST"
+            return pst_time.strftime('%m/%d/%Y %I:%M %p') + " PST"  
 
         # Check if 'CreationDate' column exists in the DataFrame
-        if 'CreationDate' in df.columns:
+        if 'CreationDate' in df_copy.columns:
             # Apply the conversion to each row
-            df['CreationDate_PST'] = df.apply(convert_row, axis=1)
+            df_copy['CreationDate_PST'] = df_copy.apply(convert_row, axis=1)
         else:
             # Handle the case where 'CreationDate' is not in the DataFrame
             print("Column 'CreationDate' not found in DataFrame.")
-            return None  # Explicitly return None if the column is not found
+            return None  # Explicitly return None if the column is not found    
 
-        return df  # Return the modified DataFrame
+        return df_copy  # Return the modified DataFrame
     def analyze_ips_in_timeframe(self, df, hours, min_unique_ips, min_unique_states, scenario_str):
         '''looks for flags through df data'''
         results = []
@@ -247,6 +249,64 @@ class O365Auditor():
                         last_report_times[user_id] = start_time  # Update the last report time for the user
 
         return results
+    def analyze_foreign_ips(self, df, hr=24):
+        '''pulls out foreign IP addresses (as a flag) over a specified timeframe (defualting to 24 hour segments)'''
+        results = []
+        last_report_times = {}  # To track the last report time for each user
+
+        # Create a copy of the DataFrame to avoid SettingWithCopyWarning
+        df_copy = df.copy()
+
+        # Convert UTC to PST
+        df_copy['PSTCreationDate'] = pd.to_datetime(df_copy['CreationDate']).dt.tz_localize('UTC').dt.tz_convert('US/Pacific')
+
+        # Grouping the DataFrame by 'Operation' column
+        grouped_df = df_copy.groupby('Operation')
+
+        for operation, group_df in grouped_df:
+            # only used for user logged in action
+            if operation == 'UserLoggedIn':
+                for i in range(len(group_df)):
+                    user_id = group_df.iloc[i]["Resulting Usr"]
+                    start_time = group_df.iloc[i]['PSTCreationDate']
+                    readable_start_time = start_time.strftime('%m/%d/%Y %I:%M %p') + " PST"
+
+                    # Skip if the user has a recent report within the timeframe
+                    if user_id in last_report_times and (start_time - last_report_times[user_id]).total_seconds() / 3600 < hr:
+                        continue
+
+                    end_time = start_time + pd.Timedelta(hours=hr)
+                    relevant_rows = df_copy[(df_copy['PSTCreationDate'] >= start_time) & (df_copy['PSTCreationDate'] <= end_time)]
+
+                    foreign_ips = []
+                    for ip in relevant_rows['ClientIP'].unique():
+                        if ip != '':
+                            try:
+                                ip_details = self.find_ip_details(ip)
+                                if ip_details.get('state') not in self.us_state_abbreviations:
+                                    foreign_ips.append({'ip': ip, 'details': ip_details})
+                            except Exception as e:
+                                self.log.log(f'Error fetching IP details for {ip}: {e}')
+
+                    if foreign_ips:
+                        unique_id = str(uuid.uuid4())
+                        report = [{'ip': ip_info['ip'], 'location': ip_info['details'].get('country', 'Unknown'), 'logins':1, 'uuid': unique_id}
+                                  for ip_info in foreign_ips]
+
+                        results.append({'Scenario': 'foriegn IP',
+                                        'Operation': operation,
+                                        'Start Time': readable_start_time,
+                                        'User': user_id,
+                                        'ip_count': len(report),
+                                        'location_count': 1,
+                                        'location_list': [instance['location'] for instance in report],
+                                        'Report': report,
+                                        'uuid': unique_id})
+
+                        last_report_times[user_id] = start_time  # Update last report time
+
+        return results
+
     def parse_datetime(self, time_str):
         '''parses teh date times for the results, needs to work with PST which is a string and doesnt parse well'''
         # Remove the 'PST' part and parse the datetime
@@ -290,7 +350,6 @@ class O365Auditor():
     def filter_df_for_report(self, df, usr, ip_list, ip_mode):
         '''filters df for activity report by only looking at the correct user and correct ips'''
         '''takes the 'self.df_w_all_usrs' and filteres the ips & not availables before continuing'''
-        self.df_to_excel(df, r'C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages\debug.xlsx')
         usr_filtered_df = df[(df['Resulting Usr'].str.lower() == str(usr).lower()) | (df['Resulting Usr'] == "Column missing")]
         if ip_mode == "exclude":
             ip_filtered_df = usr_filtered_df[~usr_filtered_df['ActorIpAddress'].isin(ip_list)]
@@ -351,8 +410,8 @@ class O365Auditor():
         self.df_created = self.df_created.drop_duplicates(subset=['CreationDate', 'UserIds', 'Operations','AuditData','Identity'])
 
         # Combine all CSV files into one
-        self.report_path = f"{self.folder_path}\AuditLogFull.csv"
-        self.df_created.to_csv(self.report_path, index=False)
+        # self.report_path = f"{self.folder_path}\AuditLogFullRaw.csv"
+        # self.df_created.to_csv(self.report_path, index=False)
     def process_segment(self, start_date, end_date, pageNumber, sessionId):
         '''This loops through each date segment, grabbing the data in 1000 row increments, setting up a page for each increment'''
         moreData = True
@@ -382,7 +441,7 @@ class O365Auditor():
         '''powershell that does the audit, gets looped many time over by handlers'''
         commands = f'''{self.login_command}
             $ExportPath = "{exportPath}"
-            $Results = Search-UnifiedAuditLog -StartDate "{start_date.strftime('%m/%d/%Y')} 00:00:00" -EndDate "{end_date.strftime('%m/%d/%Y')} 00:00:00" -Operations "UserLoggedIn", "UserLoginFailed" -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
+            $Results = Search-UnifiedAuditLog -StartDate "{start_date.strftime('%m/%d/%Y')} 00:00:00" -EndDate "{end_date.strftime('%m/%d/%Y')} 00:00:00" -Operations {self.operation} -ResultSize 1000 -SessionId "{sessionId}" -SessionCommand ReturnLargeSet
             $Results | Export-Csv -Path $ExportPath
             '''
         time.sleep(2)
@@ -466,6 +525,11 @@ class O365Auditor():
                 min_unique_ips=5, 
                 min_unique_states=1, 
                 scenario_str="IP Variance")) 
+            
+            results.extend(self.analyze_foreign_ips(
+                df=self.dfs[usr]
+            ))
+
         self.log.log(f"processed {len(self.dfs)} users")
         return results
     def order_results(self, results):
@@ -501,21 +565,21 @@ class O365Auditor():
 
         # Finding duplicates
         fields_to_compare = ['Start Time', 'User', 'location list']
-        ss_posting_data = self.return_unique_posting_data(self.processing_data, sheet_data, fields_to_compare)
+        self.ss_posting_data = self.return_unique_posting_data(self.processing_data, sheet_data, fields_to_compare)
 
-        self.log.log('posting: ', ss_posting_data)
+        self.log.log(f'posting: {self.ss_posting_data}')
 
-        return ss_posting_data
+        return self.ss_posting_data
     #endregion
-    
-    def run(self, starddate, enddate):
-        self.paginated_pwrshl_grab_raw(starddate, enddate)
-        self.df_flattened = self.flatten_df_data(self.df_created)
-        self.df_w_ip = self.add_ip_columns(self.df_flattened)
-        self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
-        self.results = self.audit_by_user(self.df_w_all_usrs)
-        self.ordered_results = self.order_results(self.results)
+    #region run helpers
+    def audit_login_data(self, df):
+        '''these functions are only good for login data, not other types'''
+        self.audit_results = self.audit_by_user(df)
+        self.ordered_results = self.order_results(self.audit_results)
         self.processing_data = self.transform_for_dataprocessing(self.ordered_results)
+        return self.processing_data
+    def post_audit_findings(self, df):
+        '''posts audit findings to smartsheet'''
         self.ss_post_data = self.prep_ss_post(self.processing_data)
         try:
             self.gridsheet.post_new_rows(self.ss_post_data)
@@ -523,11 +587,22 @@ class O365Auditor():
             # if self.ss_post_data is empty
             pass
         self.gridsheet.handle_update_stamps()
+    #endregion
+    def run(self, starddate, enddate):
+        '''main audit engine'''
+        self.paginated_pwrshl_grab_raw(starddate, enddate)
+        self.df_flattened = self.flatten_df_data(self.df_created)
+        self.df_w_ip = self.add_ip_columns(self.df_flattened)
+        self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
+        self.df_to_excel(self.df_w_all_usrs, r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFullProcessed.xlsx")
+        self.audit_login_data(self.df_w_all_usrs)
     def run_recent(self):
         '''grabs yesterday and tomorrow for run's inputs'''
         today_date = datetime.now().strftime("%m/%d/%Y")
         formatted_yesterday, formatted_tomorrow = self.get_surrounding_days(today_date)
         self.run(formatted_yesterday, formatted_tomorrow)
+        self.post_audit_findings(self.processing_data)
+
     def run_activity_report(self, activity_date, usr, ip_list = [], ip_mode = 'exclude'):
         '''to explore suspicious activity of specific user on specific day
         ip_mode will either be exclude or include, to search for SPECIFIC ip, or all ip EXCEPT specific one'''
@@ -541,7 +616,7 @@ class O365Auditor():
         self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
         self.filtered_df = self.filter_df_for_report(self.df_w_all_usrs, usr, ip_list, ip_mode)
         final_df = self.convert_df_utc_to_pst(self.filtered_df)
-        self.df_to_excel(final_df, r'C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages\AuditLogResults_Page.xlsx')
+        self.df_to_excel(final_df, r'C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\ActivityReport.xlsx')
 
 if __name__ == "__main__":
     config = {
@@ -550,15 +625,18 @@ if __name__ == "__main__":
         'pages_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\Audit Log Pages",
         'powerbi_backend_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\audit_data_for_analysis.xlsx",
         # 'operations':['Reset user password.', 'Set force change user password.', 'Change user password.']
-        'operations': ['UserLoggedIn', 'UserLoginFailed'],
+        # 'operations': ['UserLoggedIn', 'UserLoginFailed'],
+        'operations': ['UserLoggedIn', 'New-InboxRule', 'Set-InboxRule'],
         'smartsheet_token':smartsheet_token,
-        'ss_gui_sheetid': 4506324192677764
+        'ss_gui_sheetid': 4506324192677764,
+        'email': 'ariel-admin@dowbuilt.com'
     }
 
     oa = O365Auditor(config)
     # For using existing data
     # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
     # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull.csv")
-    # oa.run('12/15/2023', '12/20/2023')
-    # oa.run_recent()
-    oa.run_activity_report('11/20/2023', 'lizette@dowbuilt.com')
+    # oa.run('09/01/2023', '12/28/2023')
+    oa.run_recent()
+    # oa.run_activity_report('12/27/2023', 'arielv@dowbuilt.com')
+
