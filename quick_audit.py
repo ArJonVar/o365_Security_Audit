@@ -293,7 +293,7 @@ class O365Auditor():
                         report = [{'ip': ip_info['ip'], 'location': ip_info['details'].get('country', 'Unknown'), 'logins':1, 'uuid': unique_id}
                                   for ip_info in foreign_ips]
 
-                        results.append({'Scenario': 'foriegn IP',
+                        results.append({'Scenario': 'Foreign IP',
                                         'Operation': operation,
                                         'Start Time': readable_start_time,
                                         'User': user_id,
@@ -306,7 +306,6 @@ class O365Auditor():
                         last_report_times[user_id] = start_time  # Update last report time
 
         return results
-
     def parse_datetime(self, time_str):
         '''parses teh date times for the results, needs to work with PST which is a string and doesnt parse well'''
         # Remove the 'PST' part and parse the datetime
@@ -334,14 +333,15 @@ class O365Auditor():
                 unique_posting_data.append(item)    
 
         return unique_posting_data
-    def get_surrounding_days(self, date_str):
-        '''explain'''
+    def get_surrounding_days(self, date_str, surrounding_day_number):
+        '''it takes a date, and sourrounding day number, and returns a start and end date, 
+        such that the stard and end date are each X days from the origin, where x is the surrounding day number'''
         date_obj = datetime.strptime(date_str, "%m/%d/%Y")
         # Calculating yesterday's date (the day before today)
-        startdate = date_obj - timedelta(days=2)
+        startdate = date_obj - timedelta(days=surrounding_day_number)
 
         # Calculating tomorrow's date (the day after today)
-        enddate = date_obj + timedelta(days=2)
+        enddate = date_obj + timedelta(days=surrounding_day_number)
 
         # Formatting the dates as mm/dd/yyyy
         formatted_startdate = startdate.strftime("%m/%d/%Y")
@@ -445,7 +445,7 @@ class O365Auditor():
             $Results | Export-Csv -Path $ExportPath
             '''
         time.sleep(2)
-        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", commands], capture_output=True, text=True)
+        self.p = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", commands], capture_output=True, text=True)
     #endregion
     #region process data
     def flatten_df_data(self, df):
@@ -553,7 +553,8 @@ class O365Auditor():
                     'report login count': report['logins'],
                     'report location': report['location'],
                     'report ip': report['ip'],
-                    'HIDE_report uuid': report['uuid']
+                    'HIDE_report uuid': report['uuid'],
+                    'Status': 'Unknown'
                 })
         
         return flattened_data
@@ -571,13 +572,32 @@ class O365Auditor():
 
         return self.ss_posting_data
     #endregion
-    #region run helpers
+    #region audit helpers
     def audit_login_data(self, df):
         '''these functions are only good for login data, not other types'''
         self.audit_results = self.audit_by_user(df)
         self.ordered_results = self.order_results(self.audit_results)
         self.processing_data = self.transform_for_dataprocessing(self.ordered_results)
         return self.processing_data
+    def audit_inboxrules(self, origin_date):
+        '''report that shows inbox changes in the last 15 days'''
+        self.log.log('exporting inbox rule changes')
+        self.config['operations'] = ['New-InboxRule', 'Set-InboxRule']
+        self.operation = ', '.join([f'"{item}"' for item in self.config.get('operations')])
+        startdate, enddate = self.get_surrounding_days(date_str = origin_date, surrounding_day_number = 15)
+        self.audit_timeframe(startdate,enddate)
+        self.df_to_excel(self.df_w_all_usrs, r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\InboxRuleChangeLog.xlsx")
+    def audit_pw_changes(self, origin_date):
+        '''report that shows pw changes in last 30 days'''
+        self.log.log('exporting exporting pw changes')
+        self.config['operations'] = ['Change user password.', 'Reset user password.', 'Set force change user password.']
+        self.operation = ', '.join([f'"{item}"' for item in self.config.get('operations')])
+        startdate, enddate = self.get_surrounding_days(date_str = origin_date, surrounding_day_number = 30)
+        self.paginated_pwrshl_grab_raw(startdate, enddate)
+        self.df_flattened = self.flatten_df_data(self.df_created)
+        self.df_flattened['UserIds'] = self.df_flattened['ObjectId']
+        self.df_to_excel(self.df_flattened, r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\PasswordChangeLog.xlsx")
+
     def post_audit_findings(self, df):
         '''posts audit findings to smartsheet'''
         self.ss_post_data = self.prep_ss_post(self.processing_data)
@@ -588,35 +608,23 @@ class O365Auditor():
             pass
         self.gridsheet.handle_update_stamps()
     #endregion
-    def run(self, starddate, enddate):
+    def audit_timeframe(self, startdate, enddate):
         '''main audit engine'''
-        self.paginated_pwrshl_grab_raw(starddate, enddate)
+        self.paginated_pwrshl_grab_raw(startdate, enddate)
         self.df_flattened = self.flatten_df_data(self.df_created)
         self.df_w_ip = self.add_ip_columns(self.df_flattened)
         self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
+
+    def audit_routine(self):
+        '''the run script designed to be run daily. runs for two days forward and back, and then posts the findings to smartsheet (that are non duplicate with what is already there)'''
+        today_date = datetime.now().strftime("%m/%d/%Y")
+        startdate, enddate = self.get_surrounding_days(date_str = today_date, surrounding_day_number = 2)
+        self.audit_timeframe(startdate, enddate)
         self.df_to_excel(self.df_w_all_usrs, r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFullProcessed.xlsx")
         self.audit_login_data(self.df_w_all_usrs)
-    def run_recent(self):
-        '''grabs yesterday and tomorrow for run's inputs'''
-        today_date = datetime.now().strftime("%m/%d/%Y")
-        formatted_yesterday, formatted_tomorrow = self.get_surrounding_days(today_date)
-        self.run(formatted_yesterday, formatted_tomorrow)
         self.post_audit_findings(self.processing_data)
-
-    def run_activity_report(self, activity_date, usr, ip_list = [], ip_mode = 'exclude'):
-        '''to explore suspicious activity of specific user on specific day
-        ip_mode will either be exclude or include, to search for SPECIFIC ip, or all ip EXCEPT specific one'''
-        startdate, enddate = self.get_surrounding_days(activity_date)
-        print(f'working on time segment {startdate}-{enddate}')
-        self.action_to_files_in_folder(self.pages_path, 'delete')
-        self.basic_pwrshl_grab_raw(startdate, enddate, usr)
-        self.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
-        self.df_flattened = self.flatten_df_data(self.df_created)
-        self.df_w_ip = self.add_ip_columns(self.df_flattened)
-        self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
-        self.filtered_df = self.filter_df_for_report(self.df_w_all_usrs, usr, ip_list, ip_mode)
-        final_df = self.convert_df_utc_to_pst(self.filtered_df)
-        self.df_to_excel(final_df, r'C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\ActivityReport.xlsx')
+        self.audit_inboxrules(origin_date = today_date)
+        self.audit_pw_changes(origin_date = today_date)
 
 if __name__ == "__main__":
     config = {
@@ -626,17 +634,16 @@ if __name__ == "__main__":
         'powerbi_backend_path':r"C:\Egnyte\Shared\IT\o365 Security Audit\audit_data_for_analysis.xlsx",
         # 'operations':['Reset user password.', 'Set force change user password.', 'Change user password.']
         # 'operations': ['UserLoggedIn', 'UserLoginFailed'],
-        'operations': ['UserLoggedIn', 'New-InboxRule', 'Set-InboxRule'],
+        'operations': ['UserLoggedIn'],
+        # 'operations': ['UserLoggedIn', 'New-InboxRule', 'Set-InboxRule'],
         'smartsheet_token':smartsheet_token,
         'ss_gui_sheetid': 4506324192677764,
+        # 'email': 'microsoftlogs@dowbuilt.com'
         'email': 'ariel-admin@dowbuilt.com'
     }
 
     oa = O365Auditor(config)
     # For using existing data
-    # oa.df_created = pd.concat([oa.create_df(csv) for csv in oa.action_to_files_in_folder(oa.pages_path, 'grab path from')]).sort_values(by='CreationDate')
-    # oa.df_created = pd.read_csv(r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\AuditLogFull.csv")
-    # oa.run('09/01/2023', '12/28/2023')
-    oa.run_recent()
-    # oa.run_activity_report('12/27/2023', 'arielv@dowbuilt.com')
+    # oa.audit_timeframe('09/03/2023', '12/29/2023')
+    oa.audit_routine()
 
