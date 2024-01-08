@@ -283,7 +283,7 @@ class O365Auditor():
                         if ip != '':
                             try:
                                 ip_details = self.find_ip_details(ip)
-                                if ip_details.get('state') not in self.us_state_abbreviations:
+                                if ip_details.get('state') not in self.us_state_abbreviations and ip_details.get('country', 'Unknown') != "United States":
                                     foreign_ips.append({'ip': ip, 'details': ip_details})
                             except Exception as e:
                                 self.log.log(f'Error fetching IP details for {ip}: {e}')
@@ -597,7 +597,6 @@ class O365Auditor():
         self.df_flattened = self.flatten_df_data(self.df_created)
         self.df_flattened['UserIds'] = self.df_flattened['ObjectId']
         self.df_to_excel(self.df_flattened, r"C:\Egnyte\Shared\IT\o365 Security Audit\Programatic Audit Log Results\PasswordChangeLog.xlsx")
-
     def post_audit_findings(self, df):
         '''posts audit findings to smartsheet'''
         self.ss_post_data = self.prep_ss_post(self.processing_data)
@@ -614,7 +613,6 @@ class O365Auditor():
         self.df_flattened = self.flatten_df_data(self.df_created)
         self.df_w_ip = self.add_ip_columns(self.df_flattened)
         self.df_w_all_usrs = self.expose_ios_users(self.df_w_ip)
-
     def audit_routine(self):
         '''the run script designed to be run daily. runs for two days forward and back, and then posts the findings to smartsheet (that are non duplicate with what is already there)'''
         today_date = datetime.now().strftime("%m/%d/%Y")
