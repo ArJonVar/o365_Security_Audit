@@ -284,7 +284,9 @@ class O365Auditor():
                             try:
                                 ip_details = self.find_ip_details(ip)
                                 if ip_details.get('state') not in self.us_state_abbreviations and ip_details.get('country', 'Unknown') != "United States":
-                                    foreign_ips.append({'ip': ip, 'details': ip_details})
+                                    # had to write exception for david simon :/, maybe we should have a list of exceptions?
+                                    if user_id.lower() != "davids@dowbuilt.com" and ip_details.get('country', 'Unknown') != "Thailand":
+                                        foreign_ips.append({'ip': ip, 'details': ip_details})
                             except Exception as e:
                                 self.log.log(f'Error fetching IP details for {ip}: {e}')
 
