@@ -686,7 +686,9 @@ class O365Auditor():
 
         for data in self.ss_posting_data:
             data['Disabled MFA Accounts'] = ""
-        self.ss_posting_data['Disabled MFA Accounts'] = self.disactivated_mfa_string
+        
+        if len(self.ss_posting_data) != 0:
+            self.ss_posting_data[len(self.ss_posting_data)-1]['Disabled MFA Accounts'] = self.disactivated_mfa_string
 
         self.log.log(f'posting: {self.ss_posting_data}')
 
